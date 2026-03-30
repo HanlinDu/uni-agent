@@ -39,6 +39,21 @@ Uni-Agent is built around a unified interaction loop with three parts: `model`, 
 
 This interaction stack is used for large-scale agent execution and can be connected to [verl](https://github.com/verl-project/verl) for scalable RL training.
 
+## Installation 📦
+
+Uni-Agent builds on top of latest `verl` release and can use it as a normal Python package.
+
+```bash
+git submodule update --init --recursive
+pip install -e --no-deps ./verl
+
+# Other Dependencies
+pip install swe-rex loguru pydantic pydantic_settings aiohttp
+```
+
+See the full installation guide in the docs: [Installation](https://uni-agent.readthedocs.io/en/latest/start/installation.html).
+
+
 ## Live Dashboard 👀
 
 <img src="./assets/dashboard.png" width="100%" alt="Uni-Agent Dashboard overview">

@@ -20,6 +20,27 @@ Uni-Agent is currently based on the `verl 0.7.1` release. We recommend using the
 
 ---
 
+## Install `verl`
+
+Install `verl 0.7.1` first. Uni-Agent uses `verl` as a normal Python package dependency. We recommend using an editable install when working from this repo, because it makes it easier to keep the `verl` package environment synchronized across multi-node training setups.
+
+Recommended: use the bundled `verl` checkout/submodule in this repo:
+
+```bash
+git submodule update --init --recursive
+pip install -e --no-deps ./verl
+```
+
+Alternatively, you can install from PyPI:
+
+```bash
+pip install verl==0.7.1
+```
+
+The editable install is especially useful when you want Uni-Agent and `verl` to live in the same workspace during development or keep `verl` aligned across distributed training environments.
+
+---
+
 ## Extra Dependencies
 
 On top of the base `verl` environment, Uni-Agent typically needs the following Python packages:
