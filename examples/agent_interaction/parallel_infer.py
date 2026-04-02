@@ -12,12 +12,41 @@ import verl
 from verl import DataProto
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.workers.rollout.utils import get_max_position_embeddings
 
 # Setup basic logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=os.getenv("VERL_LOGGING_LEVEL", "INFO")
 )
 logger = logging.getLogger(__name__)
+
+
+def _resolve_sequence_lengths(args: argparse.Namespace) -> tuple[int, int]:
+    from transformers import AutoConfig
+
+    model_path = os.path.expanduser(args.model_path)
+    model_hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    max_position_embeddings = get_max_position_embeddings(model_hf_config)
+
+    if args.prompt_length >= max_position_embeddings:
+        raise ValueError(
+            f"prompt_length ({args.prompt_length}) should be less than model max_position_embeddings "
+            f"({max_position_embeddings})"
+        )
+
+    max_response_length = max_position_embeddings - args.prompt_length
+    response_length = min(args.response_length, max_response_length)
+    if response_length != args.response_length:
+        logger.warning(
+            "Requested prompt_length + response_length exceeds model context window. "
+            "Clamping response_length from %d to %d so max_model_len fits within %d.",
+            args.response_length,
+            response_length,
+            max_position_embeddings,
+        )
+
+    max_model_len = args.prompt_length + response_length
+    return response_length, max_model_len
 
 
 def init_config(args: argparse.Namespace) -> DictConfig:
@@ -28,6 +57,8 @@ def init_config(args: argparse.Namespace) -> DictConfig:
     config_dir = str(Path(verl.__file__).resolve().parent / "trainer" / "config")
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         config = compose(config_name="ppo_trainer")
+
+    response_length, max_model_len = _resolve_sequence_lengths(args)
 
     # Override rollout configs
     config.actor_rollout_ref.rollout.agent.agent_loop_config_path = os.path.expanduser(args.agent_config_path)
@@ -53,15 +84,18 @@ def init_config(args: argparse.Namespace) -> DictConfig:
     config.actor_rollout_ref.rollout.name = args.engine
     config.actor_rollout_ref.rollout.mode = "async"
     config.actor_rollout_ref.rollout.prompt_length = args.prompt_length
-    config.actor_rollout_ref.rollout.response_length = args.response_length
+    config.actor_rollout_ref.rollout.response_length = response_length
     config.actor_rollout_ref.rollout.n = args.n
     config.actor_rollout_ref.rollout.tensor_model_parallel_size = args.tensor_parallel_size
-    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.9
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
+    if args.max_samples > 0:
+        config.actor_rollout_ref.rollout.max_num_seqs = args.max_samples
+    config.actor_rollout_ref.rollout.max_model_len = max_model_len
 
     # Data configs
     config.data.return_raw_chat = True
     config.data.max_prompt_length = args.prompt_length
-    config.data.max_response_length = args.response_length
+    config.data.max_response_length = response_length
 
     return config
 
