@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from pydantic import BaseModel, Field
+
 from uni_agent.tools.base import AbstractTool
 from uni_agent.tools.registry import register_tool
 
@@ -21,6 +23,33 @@ Notes for using the `str_replace` command:
 """.strip()
 
 
+class StrReplaceEditorArguments(BaseModel):
+    command: str = Field(
+        description="The commands to run. Allowed options are: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
+        json_schema_extra={"enum": ["view", "create", "str_replace", "insert", "undo_edit"]},
+    )
+    path: str = Field(description="Absolute path to file or directory, e.g. `/testbed/file.py` or `/testbed`.")
+    file_text: str = Field(
+        default=None, description="Required parameter of `create` command, with the content of the file to be created."
+    )
+    old_str: str = Field(
+        default=None,
+        description="Required parameter of `str_replace` command containing the string in `path` to replace.",
+    )
+    new_str: str = Field(
+        default=None,
+        description="Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.",
+    )
+    insert_line: int = Field(
+        default=None,
+        description="Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.",
+    )
+    view_range: list[int] = Field(
+        default=None,
+        description="Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.",
+    )
+
+
 @register_tool("str_replace_editor")
 class StrReplaceEditorTool(AbstractTool):
     @property
@@ -32,49 +61,10 @@ class StrReplaceEditorTool(AbstractTool):
         return Path(__file__).parent / "str_replace_editor"
 
     def get_tool_schema(self) -> dict:
-        return {
-            "type": "function",
-            "function": {
-                "name": "str_replace_editor",
-                "description": DESCRIPTION,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "command": {
-                            "type": "string",
-                            "description": "The commands to run. Allowed options are: `view`, `create`, `str_replace`, `insert`, `undo_edit`.",
-                            "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Absolute path to file or directory, e.g. `/testbed/file.py` or `/testbed`.",
-                        },
-                        "file_text": {
-                            "type": "string",
-                            "description": "Required parameter of `create` command, with the content of the file to be created.",
-                        },
-                        "old_str": {
-                            "type": "string",
-                            "description": "Required parameter of `str_replace` command containing the string in `path` to replace.",
-                        },
-                        "new_str": {
-                            "type": "string",
-                            "description": "Optional parameter of `str_replace` command containing the new string (if not given, no string will be added). Required parameter of `insert` command containing the string to insert.",
-                        },
-                        "insert_line": {
-                            "type": "integer",
-                            "description": "Required parameter of `insert` command. The `new_str` will be inserted AFTER the line `insert_line` of `path`.",
-                        },
-                        "view_range": {
-                            "type": "array",
-                            "description": "Optional parameter of `view` command when `path` points to a file. If none is given, the full file is shown. If provided, the file will be shown in the indicated line number range, e.g. [11, 12] will show lines 11 and 12. Indexing at 1 to start. Setting `[start_line, -1]` shows all lines from `start_line` to the end of the file.",
-                            "items": {"type": "integer"},
-                        },
-                    },
-                    "required": ["command", "path"],
-                },
-            },
-        }
+        return self.build_tool_schema(
+            description=DESCRIPTION,
+            arguments_model=StrReplaceEditorArguments,
+        )
 
     def get_install_command(self) -> str:
         return "python -m pip install 'tree-sitter==0.21.3' || true && python -m pip install 'tree-sitter-languages' || true"

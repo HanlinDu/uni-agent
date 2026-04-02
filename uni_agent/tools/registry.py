@@ -1,5 +1,5 @@
 # ruff: noqa
-"""Tool definitions: abstract base and concrete tools with description and get_install_command."""
+"""Tool registry for concrete AbstractTool implementations and their schema/install hooks."""
 
 from uni_agent.tools.base import AbstractTool
 

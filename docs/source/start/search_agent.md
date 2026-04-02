@@ -23,6 +23,7 @@ This tool contains two files, and they have different roles:
 - `uni_agent/tools/search_arxiv/__init__.py`:
   - This file registers the tool and defines its schema.
   - The schema tells the agent model what the tool does and how to call it.
+  - The recommended pattern is to define an `Arguments(BaseModel)` class for the tool parameters and then call `AbstractTool.build_tool_schema(...)` to generate the tool schema.
 - `uni_agent/tools/search_arxiv/search_arxiv`:
   - This is the executable script that is copied into the environment and actually runs the search.
   - It is installed into the environment and can be executed directly by the agent.
