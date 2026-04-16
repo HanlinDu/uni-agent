@@ -16,6 +16,10 @@ class MaxTokenExceededError(Exception):
     pass
 
 
+class ChatTemplateCompatibilityError(RuntimeError):
+    """Raised when a tokenizer chat template is incompatible with incremental tool-response appending."""
+
+
 class AgentChatModel:
     client: Any
     """AsyncLLM server manager"""
@@ -139,17 +143,49 @@ class AgentChatModel:
 
     async def _get_new_message_ids(self, new_messages: list[dict[str, str]]) -> list[int]:
         messages = [{"role": "system", "content": "mock message"}]
-        system_prompt_ids = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.apply_chat_template(messages, tokenize=True)
+        base_prompt_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                tools=self.tools_schemas,
+            ),
         )
-        system_prompt_ids = normalize_token_ids(system_prompt_ids)
-        eos_index = system_prompt_ids.index(self.tokenizer.eos_token_id)
+        base_prompt_ids = normalize_token_ids(base_prompt_ids)
         messages.extend(new_messages)
         full_prompt_ids = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                tools=self.tools_schemas,
+            ),
         )
         full_prompt_ids = normalize_token_ids(full_prompt_ids)
-        tool_response_ids = full_prompt_ids[eos_index + 1 :]
+
+        prefix_len = 0
+        max_prefix_len = min(len(base_prompt_ids), len(full_prompt_ids))
+        while prefix_len < max_prefix_len and base_prompt_ids[prefix_len] == full_prompt_ids[prefix_len]:
+            prefix_len += 1
+
+        if prefix_len == 0:
+            raise ChatTemplateCompatibilityError(
+                "Tokenizer chat template is incompatible with incremental message appending: "
+                "failed to find a shared prompt prefix between base and follow-up rendering. "
+                f"model_eos_token_id={self.tokenizer.eos_token_id}, "
+                f"base_prompt_head={base_prompt_ids[:20]}, full_prompt_head={full_prompt_ids[:20]}"
+            )
+
+        tool_response_ids = full_prompt_ids[prefix_len:]
+        if not tool_response_ids:
+            raise ChatTemplateCompatibilityError(
+                "Tokenizer chat template is incompatible with incremental message appending: "
+                "follow-up rendering produced no appendable token suffix. "
+                f"model_eos_token_id={self.tokenizer.eos_token_id}, prefix_len={prefix_len}, "
+                f"base_prompt_tail={base_prompt_ids[-20:]}, full_prompt_tail={full_prompt_ids[-20:]}"
+            )
+
         return tool_response_ids
 
 

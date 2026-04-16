@@ -9,7 +9,7 @@ from verl.tools.schemas import OpenAIFunctionToolCall
 from verl.utils.profiler import simple_timer
 
 from .env import ActionIncorrectSyntaxError, ActionTimeoutError, AgentEnv, TerminalNotAliveError
-from .model import AgentChatModel, MaxTokenExceededError
+from .model import AgentChatModel, ChatTemplateCompatibilityError, MaxTokenExceededError
 from .tool_parser import FunctionCallFormatError
 from .tools_manager import ToolsManager
 
@@ -206,6 +206,8 @@ class AgentInteraction:
                     self.trajectory.append(step_output)
                     break
             except Exception as e:
+                if isinstance(e, ChatTemplateCompatibilityError):
+                    raise
                 # this should not happen, if it happens, we should fix the code
                 self.logger.critical(f"Exit due to unknown error: {str(e)}")
                 step_output = StepOutput(step_idx=step_idx, exit_reason="unknown_error")
