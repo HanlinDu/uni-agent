@@ -1,0 +1,249 @@
+import numpy as np
+import orjson as json
+import faiss
+import os
+import glob
+from tqdm import tqdm
+import multiprocessing as mp
+import pyarrow.parquet as pq
+import sys
+from typing import List, Tuple, Optional
+
+LOCAL_DATA_DIR = "/mnt/hdfs/went/wiki24-raw/data/en"
+VECTOR_DIMENSION = 1024
+INDEX_PATH = "/mnt/hdfs/went/wiki24/wiki24_faiss.index"
+TEXT_DATA_PATH = "/mnt/hdfs/went/wiki24/wiki24_data.jsonl"
+
+NLIST = 4096                # Number of inverted lists (cluster centroids)
+TRAINING_SAMPLES = 2000000  # Vectors used to train the centroids
+FAISS_METRIC = faiss.METRIC_L2
+
+USE_GPU = True
+NUM_GPUS = 8
+BATCH_SIZE = 10000
+
+NUM_PROCESSES = mp.cpu_count()
+if NUM_PROCESSES > 64:
+    NUM_PROCESSES = 96
+
+
+def process_parquet_file(file_path: str) -> Tuple[Optional[np.ndarray], Optional[List[bytes]]]:
+    """Read a single Parquet file in a subprocess and extract embeddings and doc metadata."""
+    try:
+        table = pq.read_table(file_path)
+        data_df = table.to_pandas()
+        
+        embeddings = np.stack(data_df["embedding"].to_numpy())
+        
+        if embeddings.dtype != np.float32:
+            embeddings = embeddings.astype(np.float32)
+
+        text_batch_lines = []
+        for _, row in data_df.iterrows():
+            doc_data = {
+                "id": str(row["id"]),
+                "url": row["url"],
+                "title": row["title"],
+                "text": row["text"],
+            }
+            json_bytes = json.dumps(doc_data) + b'\n'
+            text_batch_lines.append(json_bytes)
+            
+        return embeddings, text_batch_lines
+
+    except Exception as e:
+        print(f"Error processing file {file_path}: {e}", file=sys.stderr)
+        return None, None
+
+def setup_gpu_resources():
+    """Set up and validate GPU resources. Returns (gpu_ids, resources) or None for CPU mode."""
+    if not USE_GPU:
+        print("GPU disabled, falling back to CPU mode.")
+        return None
+        
+    try:
+        ngpus = faiss.get_num_gpus()
+        print(f"Detected {ngpus} available GPU(s).")
+        
+        if ngpus == 0:
+            print("No GPU detected, falling back to CPU mode.")
+            return None
+            
+        gpu_ids = list(range(min(ngpus, NUM_GPUS)))
+        print(f"Using GPUs: {gpu_ids}")
+        
+        res = [faiss.StandardGpuResources() for _ in gpu_ids]
+        
+        # Reserve temp memory per GPU (8 GiB)
+        for i, r in enumerate(res):
+            r.setTempMemory(int(8 * (1 << 30)))
+            
+        return gpu_ids, res
+    except Exception as e:
+        print(f"GPU initialization failed: {e}. Falling back to CPU mode.")
+        return None
+
+def create_gpu_index(gpu_id, gpu_resources, dimension, nlist, metric):
+    """Create an IVF index on the given GPU."""
+    quantizer = faiss.IndexFlatL2(dimension)
+    index = faiss.IndexIVFFlat(quantizer, dimension, nlist, metric)
+    gpu_index = faiss.index_cpu_to_gpu(gpu_resources, gpu_id, index)
+    return gpu_index
+
+def merge_gpu_indices(gpu_indices):
+    """Merge multiple GPU indices into a single CPU index."""
+    quantizer = faiss.IndexFlatL2(VECTOR_DIMENSION)
+    merged_index = faiss.IndexIVFFlat(quantizer, VECTOR_DIMENSION, NLIST, FAISS_METRIC)
+    
+    for gpu_index in gpu_indices:
+        cpu_index = faiss.index_gpu_to_cpu(gpu_index)
+        if merged_index.ntotal == 0:
+            # First merge: just take the CPU copy as-is
+            merged_index = cpu_index
+        else:
+            # Subsequent merges: reconstruct vectors and add with new ids
+            vectors = np.zeros((cpu_index.ntotal, VECTOR_DIMENSION), dtype=np.float32)
+            ids = np.arange(merged_index.ntotal, merged_index.ntotal + cpu_index.ntotal, dtype=np.int64)
+            cpu_index.reconstruct_n(0, cpu_index.ntotal, vectors)
+            merged_index.add_with_ids(vectors, ids)
+    
+    return merged_index
+
+def build_faiss_index_ivf_parallel():
+    gpu_resources = setup_gpu_resources()
+
+    parquet_files = sorted(glob.glob(os.path.join(LOCAL_DATA_DIR, "*.parquet")))
+    if not parquet_files:
+        print(f"ERROR: no Parquet files found under '{LOCAL_DATA_DIR}'. Check the path.")
+        return
+
+    print(f"Found {len(parquet_files)} Parquet files to process.")
+
+    # Stage 1: parallel I/O and preprocessing
+    all_results = []
+    vectors_processed = 0
+    try:
+        with mp.Pool(processes=NUM_PROCESSES) as pool:
+            print(f"Stage 1: Starting {NUM_PROCESSES} workers for Parallel Data Collection. Collecting to RAM...")
+
+            results_iterator = pool.imap_unordered(process_parquet_file, parquet_files)
+
+            pbar = tqdm(
+                results_iterator, 
+                total=len(parquet_files), 
+                desc="Collecting All Data Chunks to RAM", 
+                unit='file'
+            )
+            
+            for embeddings, text_batch_lines in pbar:
+                if embeddings is not None:
+                    all_results.append((embeddings, text_batch_lines))
+                    vectors_processed += len(embeddings)
+                    pbar.set_postfix({"Total Docs": f"{vectors_processed:,}"})
+
+            pbar.close()
+
+        print(f"Stage 1 Complete. Total collected documents: {vectors_processed:,}. Now proceeding to training.")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Aborting data collection stage.")
+        return
+    except Exception as e:
+        print(f"\nStage 1 (Data Collection) failed: {e}")
+        return
+        
+    if vectors_processed == 0:
+        print("No vectors collected. Aborting index build.")
+        return
+
+    # Stage 2: index training (parallel K-Means)
+    print(f"Stage 2: Training Index (NLIST={NLIST}). Using {TRAINING_SAMPLES:,} samples...")
+
+    training_vectors_list = []
+    current_count = 0
+    for embeddings, _ in all_results:
+        if current_count < TRAINING_SAMPLES:
+            take = min(TRAINING_SAMPLES - current_count, len(embeddings))
+            training_vectors_list.append(embeddings[:take])
+            current_count += take
+
+    training_matrix = np.concatenate(training_vectors_list, axis=0)
+
+    if gpu_resources is not None:
+        # Train on the first GPU, then replicate the trained index to the others.
+        gpu_ids, res = gpu_resources
+        print(f"Stage 2: Training Index with {len(gpu_ids)} GPUs...")
+
+        trained_gpu_index = create_gpu_index(gpu_ids[0], res[0], VECTOR_DIMENSION, NLIST, FAISS_METRIC)
+        trained_gpu_index.train(training_matrix)
+
+        gpu_indices = [trained_gpu_index]
+        for i in range(1, len(gpu_ids)):
+            trained_cpu_index = faiss.index_gpu_to_cpu(trained_gpu_index)
+            gpu_index = faiss.index_cpu_to_gpu(res[i], gpu_ids[i], trained_cpu_index)
+            gpu_indices.append(gpu_index)
+
+        print("GPU Index Training Complete.")
+        final_index = gpu_indices
+    else:
+        quantizer = faiss.IndexFlatL2(VECTOR_DIMENSION)
+        final_index = faiss.IndexIVFFlat(quantizer, VECTOR_DIMENSION, NLIST, FAISS_METRIC)
+
+        # Use all CPU cores during K-Means training, then restore to 1 for the add stage.
+        faiss.omp_set_num_threads(NUM_PROCESSES)
+        final_index.train(training_matrix)
+        faiss.omp_set_num_threads(1)
+        print("CPU Index Training Complete.")
+
+    # Stage 3: add vectors and write JSONL
+    print("Stage 3: Adding Vectors and Writing JSONL.")
+    current_idx = 0
+    try:
+        with open(TEXT_DATA_PATH, 'wb') as f_out:
+            pbar = tqdm(all_results, desc='Adding to Index', unit='batch')
+
+            if gpu_resources is not None:
+                # Round-robin batches across GPUs.
+                gpu_ids, _ = gpu_resources
+                gpu_indices = final_index
+
+                for batch_idx, (embeddings, text_batch_lines) in enumerate(pbar):
+                    gpu_idx = batch_idx % len(gpu_ids)
+                    current_gpu_index = gpu_indices[gpu_idx]
+
+                    f_out.writelines(text_batch_lines)
+                    current_gpu_index.add(embeddings)
+                    current_idx += len(embeddings)
+
+                    pbar.set_postfix({"Total Docs": f"{current_idx:,}", "GPU": f"{gpu_ids[gpu_idx]}"})
+
+                print("Merging GPU indices...")
+                final_index = merge_gpu_indices(gpu_indices)
+            else:
+                for embeddings, text_batch_lines in pbar:
+                    f_out.writelines(text_batch_lines)
+                    final_index.add(embeddings)
+                    current_idx += len(embeddings)
+
+                    pbar.set_postfix({"Total Docs": f"{current_idx:,}"})
+
+            pbar.close()
+
+    except Exception as e:
+        print(f"\nStage 3 (Add/Write) failed: {e}")
+        print(f"Vectors processed so far: {final_index.ntotal}")
+
+    if final_index.ntotal > 0:
+        print(f"\nFinalizing and saving FAISS index to {INDEX_PATH}...")
+        faiss.write_index(final_index, INDEX_PATH)
+        print(f"Index successfully saved with {final_index.ntotal:,} vectors.")
+    else:
+        print("Index is empty, skipping save.")
+
+
+if __name__ == "__main__":
+    # 'spawn' is safer than 'fork' for FAISS + multiprocessing.
+    if os.name != 'nt':
+        mp.set_start_method('spawn', force=True)
+
+    build_faiss_index_ivf_parallel()

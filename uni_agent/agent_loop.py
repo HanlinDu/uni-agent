@@ -37,7 +37,10 @@ class UniAgentLoop(AgentLoopBase):
         self.logger = get_logger("agent-loop", run_id=self.run_id)
         # init chat model, tools manager and environment
         self.chat_model = self._init_chat_model(config_dict["model"])
-        self.tools_manager = self._init_tools_manager(config_dict["tools"])
+        self.tools_manager = self._init_tools_manager(
+            tools_config_list=config_dict["tools"],
+            parser=config_dict.get("tool_parser", "qwen3_coder"),
+        )
         self.env = self._init_env(config_dict["env"])
         self.output_dir = Path(config_dict["log_dir"]) / self.run_id
         self.interaction = AgentInteraction(
@@ -132,11 +135,12 @@ class UniAgentLoop(AgentLoopBase):
             "sampling_params": sampling_params,
         }
         config_dict["model"] = model_config
-        # env config (set sample-wise image)
-        image_name = kwargs["tools_kwargs"]["env"]["image"]
-        post_setup_cmd = kwargs["tools_kwargs"]["env"].get("post_setup_cmd", None)
-        config_dict["env"]["deployment"]["image"] = image_name
-        config_dict["env"]["post_setup_cmd"] = post_setup_cmd
+        # env config (optionally override sample-wise image / post_setup_cmd)
+        env_kwargs = kwargs.get("tools_kwargs", {}).get("env") or {}
+        if "image" in env_kwargs:
+            config_dict["env"]["deployment"]["image"] = env_kwargs["image"]
+        if "post_setup_cmd" in env_kwargs:
+            config_dict["env"]["post_setup_cmd"] = env_kwargs["post_setup_cmd"]
         # reward module
         reward_config = config_dict.get("reward", {})
         reward_config.update(kwargs["tools_kwargs"].get("reward", {}))
@@ -147,8 +151,8 @@ class UniAgentLoop(AgentLoopBase):
         chat_model = AgentChatModel(**config_dict)
         return chat_model
 
-    def _init_tools_manager(self, tools_config_list: list[dict]) -> ToolsManager:
-        tools_manager_config = ToolsManagerConfig(**{"tools": tools_config_list})
+    def _init_tools_manager(self, tools_config_list: list[dict], parser: str = "qwen3_coder") -> ToolsManager:
+        tools_manager_config = ToolsManagerConfig(tools=tools_config_list, parser=parser)
         return ToolsManager(tools_manager_config=tools_manager_config)
 
     def _init_env(self, config_dict: dict) -> AgentEnv:
