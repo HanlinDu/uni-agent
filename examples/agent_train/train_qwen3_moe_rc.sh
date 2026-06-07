@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+RAY_DATA_HOME=/mnt/hdfs/yyding
+NNODES_ROLLOUT=16
+NNODES_TRAIN=4
+GEN_TP=2
+
 project_name=${PROJECT_NAME:-'Uni-Agent-Qwen3-Coder-30B-megatron'}
 exp_name=${EXP_NAME:-"$(date +%Y%m%d%H)_exp"}
 
@@ -8,7 +13,7 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/models/Qwen3-Coder-30B-A3B-Instruct"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/swe_agent/swe_rebench_v2_modal.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/swe_agent/swe_bench_verified.parquet"}
+TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/swe_agent/swe_bench_verified_modal.parquet"}
 RUNTIME_ENV=${RUNTIME_ENV:-"${RAY_DATA_HOME}/data/swe_agent/runtime_env.yaml"}
 # Must be launched from the repository root so Ray packages both `verl/` and `uni_agent/`.
 AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH:-"${RAY_DATA_HOME}/data/swe_agent/agent_config.yaml"}
@@ -70,8 +75,8 @@ NNODES_TRAIN=${NNODES_TRAIN:-4}
 NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 train_prompt_bsz=0
-n_resp_per_prompt=${N_RESP_PER_PROMPT:-16}
-train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-8}
+n_resp_per_prompt=${N_RESP_PER_PROMPT:-8}
+train_prompt_mini_bsz=${PPO_MINI_BATCH_SIZE:-16}
 total_rollout_steps=${TOTAL_ROLLOUT_STEPS:-10000}
 test_freq=${TEST_FREQ:-10}
 staleness_threshold=${STALENESS_THRESHOLD:-1.0}
@@ -95,8 +100,7 @@ rollout_rs_threshold=${ROLLOUT_RS_THRESHOLD:-"0.999_1.001"}      # k1: "lo_hi" r
 router_replay_mode=${ROUTER_REPLAY_MODE:-R3}                          # disabled | R2 | R3
 enable_rollout_routing_replay=${ENABLE_ROLLOUT_ROUTING_REPLAY:-True}  # required for R3 (rollout-side replay)
 
-ray job submit --no-wait --runtime-env $RUNTIME_ENV \
-    -- python3 -m verl.experimental.fully_async_policy.fully_async_main \
+python3 -m verl.experimental.fully_async_policy.fully_async_main \
     --config-name='fully_async_ppo_megatron_trainer.yaml' \
     hydra.searchpath=[pkg://verl.trainer.config] \
     data.train_files="${TRAIN_FILE}" \
@@ -209,7 +213,7 @@ ray job submit --no-wait --runtime-env $RUNTIME_ENV \
     trainer.logger=['console','wandb'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     trainer.save_freq=10 \
     trainer.total_epochs=10 \
     trainer.resume_mode=auto \
