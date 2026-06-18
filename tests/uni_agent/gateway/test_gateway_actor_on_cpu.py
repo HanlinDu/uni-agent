@@ -183,7 +183,7 @@ async def test_unknown_session_raises_404():
 def test_message_normalization_tool_call_arguments(raw_arguments, expected_arguments):
     """``MessageCodec.normalize_request`` parses valid JSON tool-call arguments
     into a dict and leaves invalid JSON as the original string."""
-    from uni_agent.gateway.codec import MessageCodec
+    from uni_agent.gateway.session import MessageCodec
 
     result = MessageCodec(FakeTokenizer()).normalize_request(
         {
@@ -210,7 +210,7 @@ async def test_request_chat_template_kwargs_forwarded(monkeypatch):
     """Per-request ``chat_template_kwargs`` are forwarded to the chat-template
     call alongside the codec-level defaults, and per-request values take
     precedence over matching codec defaults."""
-    import uni_agent.gateway.codec as codec_mod
+    import uni_agent.gateway.session.codec as codec_mod
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
@@ -350,7 +350,7 @@ async def test_tool_choice_none_skips_tool_injection_and_parser(monkeypatch):
     """When ``tool_choice="none"``, tools are cleared before encoding so the
     chat template does not inject tool-call tokens, and the tool parser is
     not used during decode — the response comes back as plain text."""
-    import uni_agent.gateway.codec as codec_mod
+    import uni_agent.gateway.session.codec as codec_mod
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
@@ -395,9 +395,9 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
     """On the first turn of a multimodal session, ``image_data`` extracted
     from the request is forwarded to the backend and recorded in the
     resulting ``Trajectory.multi_modal_data``."""
-    from uni_agent.gateway.codec import MessageCodec
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import GatewayActor
+    from uni_agent.gateway.session import MessageCodec
 
     processor = FakeProcessor()
     actor = GatewayActor.remote(
@@ -460,10 +460,8 @@ async def test_gateway_actor_forwards_image_data_on_initial_multimodal_request(r
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
-    """Full lifecycle: create, chat, complete (with reward_info), wait
-    for completion, finalize. Verifies the trajectory carries the reward
-    and the response mask is all-1 (no incremental interstitial tokens)."""
+async def test_gateway_actor_reward_info_endpoint_attaches_metadata_on_finalize(ray_runtime):
+    """The per-session reward_info endpoint stores metadata returned on finalize."""
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import GatewayActor
 
@@ -471,7 +469,7 @@ async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
     ray.get(actor.start.remote())
 
     session = ray.get(actor.create_session.remote("session-0"))
-    wait_ref = actor.wait_for_completion.remote("session-0", timeout=2.0)
+    assert session.reward_info_url.endswith("/reward_info")
 
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.post(
@@ -482,22 +480,18 @@ async def test_gateway_actor_complete_wait_and_finalize(ray_runtime):
             },
         )
         assert response.status_code == 200
-        assert response.json()["choices"][0]["message"]["content"] == "ANSWER: A"
 
-        complete = await client.post(
-            f"{session.base_url.removesuffix('/v1')}/complete",
+        reward_info = await client.post(
+            session.reward_info_url,
             json={"reward_info": {"score": 1.0, "label": "A"}},
         )
-        assert complete.status_code == 200
+        assert reward_info.status_code == 200
 
-    ray.get(wait_ref)
     trajectories = ray.get(actor.finalize_session.remote("session-0"))
     ray.get(actor.shutdown.remote())
 
     assert len(trajectories) == 1
     assert trajectories[0].reward_info == {"score": 1.0, "label": "A"}
-    assert trajectories[0].response_ids
-    assert all(mask == 1 for mask in trajectories[0].response_mask)
 
 
 @pytest.mark.asyncio
@@ -921,7 +915,7 @@ def test_canonicalize_tool_call_arguments_for_prefix_comparison(arguments_a, arg
     """``MessageCodec.canonicalize_message_for_prefix_comparison`` normalizes
     tool-call arguments so that JSON-equivalent values match, and falls back to
     raw string comparison when the arguments are not valid JSON."""
-    from uni_agent.gateway.codec import MessageCodec
+    from uni_agent.gateway.session import MessageCodec
 
     def _message(arguments):
         return {
@@ -977,29 +971,6 @@ async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_run
     assert trajectories[1].response_ids == [ord(char) for char in "SECOND"]
     assert trajectories[0].response_mask == [1] * len("FIRST")
     assert trajectories[1].response_mask == [1] * len("SECOND")
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_rejects_chat_after_complete(ray_runtime):
-    """After ``/complete`` is called, further chat requests are rejected
-    with HTTP 409 (Conflict)."""
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import GatewayActor
-
-    actor = GatewayActor.remote(GatewayActorConfig(tokenizer=FakeTokenizer()), QueuedBackend(["DONE"]))
-    ray.get(actor.start.remote())
-    session = ray.get(actor.create_session.remote("session-completed-chat"))
-    ray.get(actor.complete_session.remote("session-completed-chat"))
-
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.post(
-            f"{session.base_url}/chat/completions",
-            json={"model": "dummy-model", "messages": [{"role": "user", "content": "after complete"}]},
-        )
-
-    ray.get(actor.shutdown.remote())
-
-    assert response.status_code == 409
 
 
 @pytest.mark.parametrize(
