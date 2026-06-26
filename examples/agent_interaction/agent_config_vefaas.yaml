@@ -3,8 +3,12 @@
   _target_: uni_agent.agent_loop.UniAgentLoop
 
   concurrency: 512
-  log_dir: /tmp/swebench_qwen3_coder
+  # log_dir: /tmp/swebench_qwen3_coder
+  log_dir: /file_system/dhl/tmp/swebench_qwen3_coder
   mask_abnormal_exit_traj: false
+  # tool_parser: hermes
+  # QWen3-Coder-30B-A3B
+  tool_parser: qwen3_coder
 
   interaction:
     action_timeout: 300

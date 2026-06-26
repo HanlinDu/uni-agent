@@ -4,7 +4,7 @@ env_vars:
   PYTHONPATH: "verl"
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
   CUDA_DEVICE_MAX_CONNECTIONS: "1"
-  VLLM_DISABLE_COMPILE_CACHE: "1"
+  VLLM_DISABLE_COMPILE_CACHE: "0"
   # if you use vefaas, set the following variables
   VEFAAS_FUNCTION_ID: "xxxxxx"
   VEFAAS_FUNCTION_ROUTE: "xxxxxx"
@@ -13,3 +13,41 @@ env_vars:
   # if you use modal, set the following variables
   MODAL_TOKEN_ID: "xxxxxx"
   MODAL_TOKEN_SECRET: "xxxxxx"
+
+  # ray profile 开关
+  RAY_PROFILING: "1"
+  RAY_task_events_report_interval_ms: "1000"
+
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
+  http_proxy: ""
+  https_proxy: ""
+
+  LD_LIBRARY_PATH: "/usr/local/cuda-12.9/compat:/usr/local/cuda-12.9/lib64:/usr/lib/x86_64-linux-gnu"
+
+  # 多节点 ray 通信设置
+  GLOO_SOCKET_IFNAME: "eth1"
+  NCCL_SOCKET_IFNAME: "eth1"
+
+  # FlashInfer 的 CUTLASS/TRTLLM 不使用，默认走 triton
+  VLLM_USE_FLASHINFER_MOE_FP16: "0"
+
+  NCCL_DEBUG: "WARN"
+  NCCL_DEBUG_SUBSYS: ""
+  TORCH_DISTRIBUTED_DEBUG: "OFF"
+  VERL_LOGGING_LEVEL: "WARN"
+  VLLM_LOGGING_LEVEL: "WARNING"
+  RAY_DEDUP_LOGS: "1"
+
+  TMPDIR: "/file_system/dhl/tmp/cuda"
+  TMP: "/file_system/dhl/tmp/cuda"
+  TEMP: "/file_system/dhl/tmp/cuda"
+  TORCH_EXTENSIONS_DIR: "/file_system/dhl/cache/torch_extensions"
+  TRITON_CACHE_DIR: "/file_system/dhl/cache/triton"
+  CUDA_CACHE_PATH: "/file_system/dhl/cache/cuda"
+
+  # # 临时检查，注意删除
+  # CUDA_LAUNCH_BLOCKING: "1"
+  NCCL_IB_DISABLE: "1"
+  # NCCL_DEBUG: "INFO"
+  
