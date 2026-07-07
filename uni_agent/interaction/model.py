@@ -1,9 +1,24 @@
 import asyncio
+import logging
 import uuid
 from functools import cached_property
 from typing import Any
 
+from uni_agent.cache import (
+    build_cache_salt,
+    build_request_id,
+    compute_store_prefix_len,
+    compute_system_prefix_len,
+    get_positive_int,
+    resolve_runtime_model_cache_epoch,
+    with_model_cache_epoch,
+    enabled as extra_prefix_cache_enabled,
+    normalize_config as normalize_extra_prefix_cache_config,
+)
 from uni_agent.utils import get_event_loop, simple_timer
+
+
+fallback_logger = logging.getLogger(__name__)
 
 
 class MaxTokenExceededError(Exception):
@@ -24,6 +39,8 @@ class AgentChatModel:
     """Sampling parameters for the model"""
 
     tools_schemas: list[dict] = None
+
+    _warmed_extra_prefix_cache_salts: set[str] = set()
 
     def __init__(self, **data):
         for key, value in data.items():
@@ -46,6 +63,7 @@ class AgentChatModel:
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)
+        extra_prefix_cache = await self._build_extra_prefix_cache_metadata(messages, prompt_ids)
         return {
             "request_id": str(uuid.uuid4()),
             "prompt_ids": prompt_ids,
@@ -54,7 +72,107 @@ class AgentChatModel:
             "routed_experts": None,
             "metrics": {},
             "extra_fields": {},
+            "extra_prefix_cache": extra_prefix_cache,
         }
+
+    def _log_extra_prefix_cache(self, message: str, *args: Any) -> None:
+        rendered = message % args if args else message
+        run_logger = getattr(self, "logger", None)
+        if run_logger is not None:
+            run_logger.info(rendered)
+        else:
+            fallback_logger.info(rendered)
+
+    async def _resolve_extra_prefix_cache_config(self) -> dict[str, Any]:
+        cfg = normalize_extra_prefix_cache_config(getattr(self, "extra_prefix_cache", None))
+        if not extra_prefix_cache_enabled(cfg):
+            return cfg
+        epoch = await resolve_runtime_model_cache_epoch(cfg)
+        return with_model_cache_epoch(cfg, epoch)
+
+    async def warmup_extra_prefix_cache(self, messages: list[dict[str, str]]) -> None:
+        cfg = await self._resolve_extra_prefix_cache_config()
+        if not extra_prefix_cache_enabled(cfg):
+            self._log_extra_prefix_cache("ExtraPrefixCache warmup disabled config=%s", cfg)
+            return
+        if str(cfg.get("write_policy", "warmup_only")).lower() == "off":
+            self._log_extra_prefix_cache("ExtraPrefixCache warmup skip reason=write_policy_off config=%s", cfg)
+            return
+
+        rollout_cache = await self.prepare_rollout_cache(messages)
+        metadata = rollout_cache.get("extra_prefix_cache") or {}
+        cache_salt = metadata.get("cache_salt")
+        system_prefix_len = int(metadata.get("system_prefix_len") or 0)
+        prompt_ids = rollout_cache.get("prompt_ids") or []
+        prompt_len = len(prompt_ids)
+        chunk_size = get_positive_int(cfg, "chunk_size", 0)
+        store_prefix_len = min(
+            compute_store_prefix_len(system_prefix_len, chunk_size),
+            prompt_len,
+        )
+        if not cache_salt or system_prefix_len <= 0 or store_prefix_len <= 0:
+            self._log_extra_prefix_cache(
+                "ExtraPrefixCache warmup skip reason=missing_or_too_short_prefix cache_salt=%s system_prefix_len=%d store_prefix_len=%d chunk_size=%d prompt_len=%d",
+                cache_salt,
+                system_prefix_len,
+                store_prefix_len,
+                chunk_size,
+                prompt_len,
+            )
+            return
+        if store_prefix_len < system_prefix_len:
+            self._log_extra_prefix_cache(
+                "ExtraPrefixCache warmup align cache_salt=%s system_prefix_len=%d store_prefix_len=%d chunk_size=%d prompt_len=%d",
+                cache_salt,
+                system_prefix_len,
+                store_prefix_len,
+                chunk_size,
+                prompt_len,
+            )
+        if cache_salt in self._warmed_extra_prefix_cache_salts:
+            self._log_extra_prefix_cache(
+                "ExtraPrefixCache warmup skip reason=already_warmed cache_salt=%s system_prefix_len=%d store_prefix_len=%d prompt_len=%d",
+                cache_salt,
+                system_prefix_len,
+                store_prefix_len,
+                prompt_len,
+            )
+            return
+
+        sampling_params = dict(self.sampling_params or {})
+        sampling_params["max_tokens"] = 1
+        sampling_params.setdefault("temperature", 0.0)
+        backend_request_id = build_request_id(
+            read=False,
+            write=True,
+            store_token_limit=store_prefix_len,
+        )
+        warmup_prompt_ids = list(prompt_ids[:store_prefix_len])
+        self._log_extra_prefix_cache(
+            "ExtraPrefixCache warmup request backend_request_id=%s cache_salt=%s system_prefix_len=%d store_prefix_len=%d chunk_size=%d prompt_len=%d warmup_prompt_len=%d",
+            backend_request_id,
+            cache_salt,
+            system_prefix_len,
+            store_prefix_len,
+            chunk_size,
+            prompt_len,
+            len(warmup_prompt_ids),
+        )
+        await self.client.generate(
+            request_id=rollout_cache["request_id"],
+            prompt_ids=warmup_prompt_ids,
+            sampling_params=sampling_params,
+            backend_request_id=backend_request_id,
+            cache_salt=cache_salt,
+        )
+        self._warmed_extra_prefix_cache_salts.add(cache_salt)
+        self._log_extra_prefix_cache(
+            "ExtraPrefixCache warmup done cache_salt=%s system_prefix_len=%d store_prefix_len=%d prompt_len=%d",
+            cache_salt,
+            system_prefix_len,
+            store_prefix_len,
+            prompt_len,
+        )
 
     async def append_messages_to_rollout_cache(
         self,
@@ -99,12 +217,14 @@ class AgentChatModel:
             )
 
         sampling_params = kwargs.get("sampling_params", self.sampling_params)
+        extra_prefix_cache_kwargs = self._build_extra_prefix_cache_generate_kwargs(rollout_cache)
 
         with simple_timer("generate_sequences", metrics):
             token_output = await self.client.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
+                **extra_prefix_cache_kwargs,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
@@ -136,6 +256,82 @@ class AgentChatModel:
             )
 
         return response_str, [], rollout_cache, generation_info
+
+    async def _build_extra_prefix_cache_metadata(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_ids: list[int],
+    ) -> dict[str, Any]:
+        cfg = await self._resolve_extra_prefix_cache_config()
+        if not extra_prefix_cache_enabled(cfg):
+            return {}
+
+        from verl.utils.tokenizer import normalize_token_ids
+
+        system_messages = [message for message in messages if message.get("role") == "system"]
+        cache_salt = build_cache_salt(
+            cfg,
+            model_path=getattr(self, "model_path", None),
+            tools_schemas=self.tools_schemas,
+            system_messages=system_messages,
+        )
+        variant_messages = self._build_system_prefix_variant_messages(messages)
+        variant_prompt_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                variant_messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                tools=self.tools_schemas,
+            ),
+        )
+        variant_prompt_ids = normalize_token_ids(variant_prompt_ids)
+        system_prefix_len = compute_system_prefix_len(prompt_ids, variant_prompt_ids)
+        self._log_extra_prefix_cache(
+            "ExtraPrefixCache metadata cache_salt=%s system_prefix_len=%d prompt_len=%d variant_prompt_len=%d system_messages=%d tools=%d",
+            cache_salt,
+            system_prefix_len,
+            len(prompt_ids),
+            len(variant_prompt_ids),
+            len(system_messages),
+            len(self.tools_schemas or []),
+        )
+        return {
+            "enabled": True,
+            "cache_salt": cache_salt,
+            "system_prefix_len": system_prefix_len,
+        }
+
+    def _build_extra_prefix_cache_generate_kwargs(self, rollout_cache: dict[str, Any]) -> dict[str, Any]:
+        metadata = rollout_cache.get("extra_prefix_cache") or {}
+        cache_salt = metadata.get("cache_salt")
+        if not metadata.get("enabled") or not cache_salt:
+            return {}
+        cfg = normalize_extra_prefix_cache_config(getattr(self, "extra_prefix_cache", None))
+        read_enabled = str(cfg.get("read_policy", "rollout")).lower() != "off"
+        backend_request_id = build_request_id(read=read_enabled, write=False)
+        self._log_extra_prefix_cache(
+            "ExtraPrefixCache rollout request backend_request_id=%s cache_salt=%s read=%s write=False prompt_len=%d",
+            backend_request_id,
+            cache_salt,
+            read_enabled,
+            len(rollout_cache.get("prompt_ids") or []),
+        )
+        return {
+            "backend_request_id": backend_request_id,
+            "cache_salt": cache_salt,
+        }
+
+    def _build_system_prefix_variant_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        variant_messages: list[dict[str, Any]] = []
+        replaced_first_user = False
+        for message in messages:
+            new_message = dict(message)
+            if not replaced_first_user and new_message.get("role") == "user":
+                new_message["content"] = ""
+                replaced_first_user = True
+            variant_messages.append(new_message)
+        return variant_messages
 
     async def _get_new_message_ids(self, new_messages: list[dict[str, Any]]) -> list[int]:
         from verl.utils.chat_template import apply_chat_template

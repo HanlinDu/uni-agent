@@ -76,6 +76,8 @@ class RemoteRuntime(AbstractRuntime):
         if not self._config.host.startswith("http"):
             self.logger.warning(f"Host {self._config.host} does not start with http, adding http://")
             self._config.host = f"http://{self._config.host}"
+        if self._config.base_url:
+            self._config.base_url = self._config.base_url.rstrip("/")
 
     @classmethod
     def from_config(cls, config: RemoteRuntimeConfig, run_id: str | None = None) -> Self:

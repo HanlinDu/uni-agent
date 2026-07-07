@@ -9,6 +9,8 @@ import numpy as np
 import yaml
 
 from uni_agent.async_logging import add_file_handler, cleanup_handlers, get_logger
+from uni_agent.cache import enabled as extra_prefix_cache_enabled
+from uni_agent.cache import normalize_config as normalize_extra_prefix_cache_config
 from uni_agent.interaction import (
     AgentChatModel,
     AgentEnv,
@@ -64,6 +66,7 @@ class UniAgentLoop(AgentLoopBase):
         self.logger = get_logger("agent-loop", run_id=self.run_id)
         # init chat model, tools manager and environment
         self.chat_model = self._init_chat_model(config_dict["model"])
+        self.chat_model.logger = self.logger
         self.tools_manager = self._init_tools_manager(
             tools_config_list=config_dict["tools"],
             parser=config_dict.get("tool_parser", "qwen3_coder"),
@@ -111,6 +114,9 @@ class UniAgentLoop(AgentLoopBase):
                     await self.env.install_skills(self.skills_manager)
                     self.interaction.inject_skills_manifest()
 
+                if extra_prefix_cache_enabled(getattr(self.chat_model, "extra_prefix_cache", None)):
+                    await self.chat_model.warmup_extra_prefix_cache(self.interaction.messages)
+
                 interaction_result = await self.interaction.run()
                 interaction_result["metrics"] = dict(interaction_result.get("rollout_cache", {}).get("metrics", {}))
 
@@ -151,7 +157,7 @@ class UniAgentLoop(AgentLoopBase):
             dummy_token_id = 0
 
         max_response_length = self.config.actor_rollout_ref.rollout.response_length
-        dummy_response_length = min(512, max_response_length)
+        dummy_response_length = min(1, max_response_length)
 
         extra_fields = dict(rollout_cache.get("extra_fields") or {})
         # TODO: implement traj_mask in verl
@@ -164,7 +170,7 @@ class UniAgentLoop(AgentLoopBase):
         return AgentLoopOutput(
             prompt_ids=prompt_ids,
             response_ids=[dummy_token_id] * dummy_response_length,
-            response_mask=[0] * dummy_response_length,
+            response_mask=[1] * dummy_response_length,
             response_logprobs=[0.0] * dummy_response_length,
             routed_experts=self._synth_failed_routed_experts(dummy_response_length),
             multi_modal_data={},
@@ -273,11 +279,14 @@ class UniAgentLoop(AgentLoopBase):
             if rollout_config.max_model_len is not None
             else rollout_config.prompt_length + rollout_config.response_length
         )
+        extra_prefix_cache = normalize_extra_prefix_cache_config(rollout_config.get("extra_prefix_cache", None))
         config_dict["model"] = {
             "client": self.server_manager,
             "tokenizer": self.tokenizer,
             "max_model_len": max_model_len,
             "sampling_params": sampling_params,
+            "model_path": self.config.actor_rollout_ref.model.path,
+            "extra_prefix_cache": extra_prefix_cache,
         }
 
         if not config_dict.get("reward"):
