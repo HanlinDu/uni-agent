@@ -273,11 +273,13 @@ class UniAgentLoop(AgentLoopBase):
             if rollout_config.max_model_len is not None
             else rollout_config.prompt_length + rollout_config.response_length
         )
+        extra_prefix_cache = rollout_config.get("extra_prefix_cache", None)
         config_dict["model"] = {
             "client": self.server_manager,
             "tokenizer": self.tokenizer,
             "max_model_len": max_model_len,
             "sampling_params": sampling_params,
+            "extra_prefix_cache": extra_prefix_cache,
         }
 
         if not config_dict.get("reward"):

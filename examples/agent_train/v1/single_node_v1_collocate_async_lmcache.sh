@@ -25,12 +25,45 @@ if [[ -n "${LMCACHE_FORCE_SKIP_SAVE:-}" ]]; then
     exit 1
 fi
 
+is_true() {
+    case "${1}" in
+        True|true|1|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+LMCACHE_VALIDATION_MODE=${LMCACHE_VALIDATION_MODE:-epoch}
+case "${LMCACHE_VALIDATION_MODE}" in
+    epoch|external_reuse) ;;
+    *)
+        echo "Unsupported LMCACHE_VALIDATION_MODE=${LMCACHE_VALIDATION_MODE}; expected epoch or external_reuse." >&2
+        exit 1
+        ;;
+esac
+
+if [[ -z "${LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE:-}" ]]; then
+    if [[ "${LMCACHE_VALIDATION_MODE}" == "external_reuse" ]]; then
+        LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE=False
+    else
+        LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE=True
+    fi
+fi
+
+if [[ "${LMCACHE_VALIDATION_MODE}" == "external_reuse" ]] && is_true "${LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE}"; then
+    echo "external_reuse validation requires LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE=False." >&2
+    exit 1
+fi
+
+echo "LMCache validation mode: ${LMCACHE_VALIDATION_MODE}"
+echo "LMCache advance epoch on weight update: ${LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE}"
+
 python3 - <<'PY'
 import importlib
 
 for name in (
     "lmcache",
     "lmcache.integration.vllm.lmcache_mp_connector",
+    "verl.workers.rollout.extra_prefix_cache.lmcache_connector",
     "vllm",
     "transfer_queue",
 ):
@@ -160,7 +193,7 @@ print(f"Timed out waiting for LMCache MP server at {host}:{port}: {last_error}",
 sys.exit(1)
 PY
 
-kv_transfer_config=$(printf '{kv_connector:LMCacheMPConnector,kv_connector_module_path:lmcache.integration.vllm.lmcache_mp_connector,kv_role:kv_both,kv_connector_extra_config:{lmcache.mp.host:%s,lmcache.mp.port:%s,lmcache.mp.mp_transfer_mode:%s}}' \
+kv_transfer_config=$(printf '{kv_connector:VerlLMCacheExtraPrefixConnector,kv_connector_module_path:verl.workers.rollout.extra_prefix_cache.lmcache_connector,kv_role:kv_both,kv_connector_extra_config:{lmcache.mp.host:%s,lmcache.mp.port:%s,lmcache.mp.mp_transfer_mode:%s}}' \
     "${LMCACHE_MP_CONNECTOR_HOST}" \
     "${LMCACHE_MP_PORT}" \
     "${LMCACHE_MP_TRANSFER_MODE}")
@@ -325,6 +358,15 @@ ray_job_cmd=(
 
     actor_rollout_ref.rollout.enable_prefix_caching=True
     actor_rollout_ref.rollout.disable_log_stats=False
+    +actor_rollout_ref.rollout.extra_prefix_cache.enable=True
+    +actor_rollout_ref.rollout.extra_prefix_cache.backend=lmcache
+    +actor_rollout_ref.rollout.extra_prefix_cache.scope=system_prefix
+    +actor_rollout_ref.rollout.extra_prefix_cache.read_policy=rollout
+    +actor_rollout_ref.rollout.extra_prefix_cache.write_policy=warmup_only
+    "+actor_rollout_ref.rollout.extra_prefix_cache.namespace=${LMCACHE_EXTRA_PREFIX_NAMESPACE}"
+    "+actor_rollout_ref.rollout.extra_prefix_cache.model_cache_epoch=${LMCACHE_EXTRA_PREFIX_MODEL_EPOCH}"
+    "+actor_rollout_ref.rollout.extra_prefix_cache.advance_epoch_on_weight_update=${LMCACHE_ADVANCE_EPOCH_ON_WEIGHT_UPDATE}"
+    "+actor_rollout_ref.rollout.extra_prefix_cache.chunk_size=${LMCACHE_CHUNK_SIZE}"
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_hybrid_kv_cache_manager=True
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_transfer_config=${kv_transfer_config}"
 
@@ -370,11 +412,61 @@ if (( ray_status != 0 )); then
 fi
 
 log_search_paths=("${RAY_JOB_LOG}" "${LMCACHE_SERVER_LOG}")
-if [[ -d /tmp/ray/session_latest/logs ]]; then
-    log_search_paths+=(/tmp/ray/session_latest/logs)
+if [[ "${LMCACHE_INCLUDE_SESSION_LOGS:-False}" == "True" || "${LMCACHE_INCLUDE_SESSION_LOGS:-False}" == "true" || "${LMCACHE_INCLUDE_SESSION_LOGS:-False}" == "1" ]]; then
+    if [[ -d /tmp/ray/session_latest/logs ]]; then
+        log_search_paths+=(/tmp/ray/session_latest/logs)
+    fi
 fi
+printf 'Validation log search paths:
+'
+printf '  %s
+' "${log_search_paths[@]}"
 
 validation_failed=0
+
+if grep -R -E "ExtraPrefixCache write allow" "${log_search_paths[@]}" >/dev/null 2>&1; then
+    echo "Validation: found verl extra prefix cache warmup write allow."
+else
+    echo "Validation failed: no verl extra prefix cache write-allow policy log found." >&2
+    validation_failed=1
+fi
+
+if grep -R -E "ExtraPrefixCache write deny .*reason=policy" "${log_search_paths[@]}" >/dev/null 2>&1; then
+    echo "Validation: found verl extra prefix cache rollout write deny."
+else
+    echo "Validation failed: no verl extra prefix cache rollout write-deny policy log found." >&2
+    validation_failed=1
+fi
+
+if grep -R -E "ExtraPrefixCache read allow" "${log_search_paths[@]}" >/dev/null 2>&1; then
+    echo "Validation: found verl extra prefix cache rollout read allow."
+else
+    echo "Validation failed: no verl extra prefix cache read-allow policy log found." >&2
+    validation_failed=1
+fi
+
+if [[ "${LMCACHE_VALIDATION_MODE}" == "epoch" ]]; then
+    if grep -R -E "ExtraPrefixCache epoch advanced .*epoch=step-[0-9]+" "${log_search_paths[@]}" >/dev/null 2>&1; then
+        echo "Validation: found extra prefix cache epoch advance after weight update."
+    else
+        echo "Validation failed: no extra prefix cache epoch-advance log found." >&2
+        validation_failed=1
+    fi
+
+    if grep -R -E "cache_salt=[^[:space:]]*:step-[0-9]+:" "${log_search_paths[@]}" >/dev/null 2>&1; then
+        echo "Validation: found step-scoped extra prefix cache salt."
+    else
+        echo "Validation failed: no step-scoped extra prefix cache salt found." >&2
+        validation_failed=1
+    fi
+else
+    if grep -R -E "cache_salt=[^[:space:]]*:step-[0-9]+:" "${log_search_paths[@]}" >/dev/null 2>&1; then
+        echo "Validation failed: external_reuse mode unexpectedly used a step-scoped cache salt." >&2
+        validation_failed=1
+    else
+        echo "Validation: external_reuse mode did not use step-scoped cache salts."
+    fi
+fi
 
 if grep -R -E "LMCache hit tokens: [1-9][0-9]*|Stored [1-9][0-9]* tokens" "${log_search_paths[@]}" >/dev/null 2>&1; then
     echo "Validation: found non-zero LMCache external store/write."
@@ -385,12 +477,14 @@ fi
 
 if grep -R -E "need to load: [1-9][0-9]*|Retrieved [1-9][0-9]* tokens" "${log_search_paths[@]}" >/dev/null 2>&1; then
     echo "Validation: found at least one real LMCache retrieve/read."
-else
+elif [[ "${LMCACHE_VALIDATION_MODE}" == "external_reuse" ]]; then
     echo "Validation failed: no non-zero LMCache retrieve/read entry found." >&2
     validation_failed=1
+else
+    echo "Validation warning: no non-zero LMCache retrieve/read entry found in epoch mode; this is expected for short per-step epoch smoke."
 fi
 
-if grep -R -P -i "(?<!External )Prefix cache hit rate: (0\.[0-9]*[1-9]|[1-9][0-9]*(\.[0-9]+)?)%" "${log_search_paths[@]}" >/dev/null 2>&1; then
+if grep -R -E -i ", Prefix cache hit rate: (0\.[0-9]*[1-9]|[1-9][0-9]*(\.[0-9]+)?)%" "${log_search_paths[@]}" >/dev/null 2>&1; then
     echo "Validation: found non-zero vLLM local prefix-cache hit-rate log."
 else
     echo "Validation failed: no non-zero vLLM local prefix-cache hit-rate log found." >&2
@@ -399,6 +493,11 @@ fi
 
 if grep -R -E -i "External prefix cache hit rate: (0\.[0-9]*[1-9]|[1-9][0-9]*(\.[0-9]+)?)%" "${log_search_paths[@]}" >/dev/null 2>&1; then
     echo "Validation: found non-zero vLLM external prefix-cache hit-rate log."
+elif [[ "${LMCACHE_VALIDATION_MODE}" == "external_reuse" ]]; then
+    echo "Validation failed: no non-zero vLLM external prefix-cache hit-rate log found." >&2
+    validation_failed=1
+else
+    echo "Validation warning: no non-zero vLLM external prefix-cache hit-rate log found in epoch mode."
 fi
 
 if grep -R -E "training/num_turns/mean:np.float64\(0\.0\)|training/num_turns/mean:0\.0" "${RAY_JOB_LOG}" >/dev/null 2>&1; then

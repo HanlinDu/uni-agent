@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import json
 import uuid
 from functools import cached_property
 from typing import Any
@@ -46,6 +48,7 @@ class AgentChatModel:
             ),
         )
         prompt_ids = normalize_token_ids(prompt_ids)
+        extra_prefix_cache = await self._build_extra_prefix_cache_metadata(messages, prompt_ids)
         return {
             "request_id": str(uuid.uuid4()),
             "prompt_ids": prompt_ids,
@@ -54,6 +57,7 @@ class AgentChatModel:
             "routed_experts": None,
             "metrics": {},
             "extra_fields": {},
+            "extra_prefix_cache": extra_prefix_cache,
         }
 
     async def append_messages_to_rollout_cache(
@@ -99,12 +103,14 @@ class AgentChatModel:
             )
 
         sampling_params = kwargs.get("sampling_params", self.sampling_params)
+        extra_prefix_cache_kwargs = self._build_extra_prefix_cache_generate_kwargs(rollout_cache)
 
         with simple_timer("generate_sequences", metrics):
             token_output = await self.client.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
+                **extra_prefix_cache_kwargs,
             )
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = token_output.num_preempted if token_output.num_preempted is not None else -1
@@ -136,6 +142,67 @@ class AgentChatModel:
             )
 
         return response_str, [], rollout_cache, generation_info
+
+    async def _build_extra_prefix_cache_metadata(
+        self,
+        messages: list[dict[str, Any]],
+        prompt_ids: list[int],
+    ) -> dict[str, Any]:
+        config = getattr(self, "extra_prefix_cache", None) or {}
+        if not _extra_prefix_cache_enabled(config):
+            return {}
+
+        from verl.utils.tokenizer import normalize_token_ids
+
+        system_messages = [message for message in messages if message.get("role") == "system"]
+        variant_messages = self._build_system_prefix_variant_messages(messages)
+        variant_prompt_ids = await self.loop.run_in_executor(
+            None,
+            lambda: self.tokenizer.apply_chat_template(
+                variant_messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                tools=self.tools_schemas,
+            ),
+        )
+        variant_prompt_ids = normalize_token_ids(variant_prompt_ids)
+        stable_prefix_token_len = _compute_common_prefix_len(prompt_ids, variant_prompt_ids)
+        if stable_prefix_token_len <= 0:
+            return {}
+
+        stable_prefix_fingerprint = _short_hash(
+            {
+                "prefix_source": "uni-agent-system-prefix",
+                "system_messages": system_messages,
+                "tools": self.tools_schemas or [],
+                "tokenizer": config.get("tokenizer_fingerprint", ""),
+                "template": config.get("template_fingerprint", ""),
+            }
+        )
+        return {
+            "stable_prefix_token_len": stable_prefix_token_len,
+            "stable_prefix_fingerprint": stable_prefix_fingerprint,
+            "prefix_source": "uni-agent-system-prefix",
+            "tokenizer_fingerprint": config.get("tokenizer_fingerprint"),
+            "template_fingerprint": config.get("template_fingerprint"),
+        }
+
+    def _build_extra_prefix_cache_generate_kwargs(self, rollout_cache: dict[str, Any]) -> dict[str, Any]:
+        metadata = rollout_cache.get("extra_prefix_cache") or {}
+        if not metadata:
+            return {}
+        return {"extra_prefix_cache_metadata": metadata}
+
+    def _build_system_prefix_variant_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        variant_messages: list[dict[str, Any]] = []
+        replaced_first_user = False
+        for message in messages:
+            new_message = dict(message)
+            if not replaced_first_user and new_message.get("role") == "user":
+                new_message["content"] = ""
+                replaced_first_user = True
+            variant_messages.append(new_message)
+        return variant_messages
 
     async def _get_new_message_ids(self, new_messages: list[dict[str, Any]]) -> list[int]:
         from verl.utils.chat_template import apply_chat_template
@@ -196,6 +263,30 @@ class AgentChatModel:
                 return text_before_message_ids[i + 1 :]
 
         return []
+
+
+def _extra_prefix_cache_enabled(config: Any) -> bool:
+    if config is None:
+        return False
+    if isinstance(config, dict):
+        return bool(config.get("enable", config.get("enabled", False)))
+    try:
+        return bool(config.get("enable", config.get("enabled", False)))
+    except Exception:
+        return bool(getattr(config, "enable", getattr(config, "enabled", False)))
+
+
+def _compute_common_prefix_len(left: list[int], right: list[int]) -> int:
+    limit = min(len(left), len(right))
+    idx = 0
+    while idx < limit and left[idx] == right[idx]:
+        idx += 1
+    return idx
+
+
+def _short_hash(value: Any, length: int = 16) -> str:
+    payload = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
 # this class is only used for Inference-Only Scenario

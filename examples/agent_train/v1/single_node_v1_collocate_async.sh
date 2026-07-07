@@ -21,8 +21,8 @@ AGENT_CONFIG_SOURCE=${AGENT_CONFIG_SOURCE:-"${RAY_DATA_HOME}/code/uni-agent/exam
 # AGENT_CONFIG_TMPDIR=${AGENT_CONFIG_TMPDIR:-"/tmp"}
 AGENT_CONFIG_TMPDIR=${AGENT_CONFIG_TMPDIR:-"${RAY_DATA_HOME}/code/uni-agent/examples/agent_interaction"}
 
-RAY_PROFILING_PATH="${RAY_DATA_HOME}/${exp_name}_ray_timeline_20.json"
-# RAY_PROFILING_PATH=""
+# RAY_PROFILING_PATH="${RAY_DATA_HOME}/${exp_name}_ray_timeline_20.json"
+RAY_PROFILING_PATH=""
 
 # UniAgentLoop's sandbox concurrency belongs to its YAML, not the VERL Hydra
 # tree. Keep it intentionally small while validating abort/resume behavior.
@@ -80,11 +80,11 @@ NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
 
 # Keep both the producer backlog and each GRPO group small for initial testing.
 # Note: here should be positive bsz, not 0, different from the previous async scripts.
-train_prompt_bsz=8
-n_resp_per_prompt=4
-train_prompt_mini_bsz=8
-total_training_steps=20
-test_freq=10
+train_prompt_bsz=${TRAIN_PROMPT_BSZ:-4}
+n_resp_per_prompt=${N_RESP_PER_PROMPT:-2}
+train_prompt_mini_bsz=${TRAIN_PROMPT_MINI_BSZ:-${train_prompt_bsz}}
+total_training_steps=${TOTAL_TRAINING_STEPS:-3}
+test_freq=${TEST_FREQ:-10}
 
 cd "${RAY_DATA_HOME}/code/uni-agent"
 
@@ -197,6 +197,8 @@ ray job submit --runtime-env "${RUNTIME_ENV}" \
     actor_rollout_ref.rollout.enforce_eager=${enforce_eager} \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.hybrid_engine=True \
+    actor_rollout_ref.rollout.enable_prefix_caching=${ENABLE_PREFIX_CACHING:-False} \
+    actor_rollout_ref.rollout.disable_log_stats=${DISABLE_LOG_STATS:-False} \
     \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
     actor_rollout_ref.ref.megatron.use_dist_checkpointing=${USE_DIST_CKPT} \
@@ -208,7 +210,7 @@ ray job submit --runtime-env "${RUNTIME_ENV}" \
     reward.reward_model.enable=False \
     reward.reward_model.enable_resource_pool=False \
     \
-    trainer.logger=['console','vemlp_wandb'] \
+    trainer.logger=['console'] \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
     trainer.val_before_train=False \
@@ -222,6 +224,7 @@ ray job submit --runtime-env "${RUNTIME_ENV}" \
     trainer.nnodes=${NNODES_TRAIN} \
     trainer.n_gpus_per_node=${NGPUS_PER_NODE} \
     ray_kwargs.timeline_json_file="${RAY_PROFILING_PATH}" \
+
     actor_rollout_ref.actor.megatron.expert_model_parallel_size=${train_ep} \
     actor_rollout_ref.actor.megatron.expert_tensor_parallel_size=${train_etp} \
     actor_rollout_ref.ref.megatron.expert_model_parallel_size=${train_ep} \
